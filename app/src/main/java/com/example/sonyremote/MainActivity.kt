@@ -1,3 +1,4 @@
+
 package com.example.sonyremote
 
 import android.app.Activity
@@ -24,9 +25,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 class MainActivity : Activity() {
-    // Placeholders: set STEPS to the speaker's real number of volume steps,
-    // and START to the step it boots at (3 of 20 = 15%).
-    private val STEPS = 20
+    // Measured: the speaker takes 30 clicks to go from 0 to 100%.
+    // START = the step the app assumes after Power on (still to be measured).
+    private val STEPS = 30
     private val START = 3
 
     private val h = Handler(Looper.getMainLooper())
@@ -40,6 +41,8 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var volCard: LinearLayout
     private lateinit var powerIcon: IconView
+    private lateinit var downBtn: View
+    private lateinit var upBtn: View
     private val cells = ArrayList<GradientDrawable>()
     private val powerBg = GradientDrawable()
 
@@ -149,6 +152,8 @@ class MainActivity : Activity() {
             text = "+"; textSize = 30f; gravity = Gravity.CENTER; setTextColor(cOnAccent)
             background = box(cAccent, 20); contentDescription = "Volume up"
         }
+        downBtn = down
+        upBtn = up
         hold(down) { press(Buttons.volDn) }
         hold(up) { press(Buttons.volUp) }
         vb.addView(down, LinearLayout.LayoutParams(0, dp(72), 1f).apply { marginEnd = dp(6) })
@@ -214,12 +219,21 @@ class MainActivity : Activity() {
         }
         v.setOnTouchListener { x, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { x.alpha = 0.7f; f(); h.postDelayed(rep, 450) }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { x.alpha = 1f; h.removeCallbacks(rep) }
+                MotionEvent.ACTION_DOWN -> { if (!isLocked(x)) x.alpha = 0.7f; f(); h.postDelayed(rep, 450) }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    x.alpha = if (isLocked(x)) 0.35f else 1f
+                    h.removeCallbacks(rep)
+                }
             }
             true
         }
     }
+
+    // Vol down is locked at 0%, Vol up is locked at 100%, so the count can't drift.
+    private fun isLocked(v: View) =
+        on && ((v === downBtn && level == 0) || (v === upBtn && level == STEPS))
+
+    private fun pct() = Math.round(level * 100f / STEPS)
 
     private fun transmit(b: Btn): Boolean {
         val m = ir
@@ -230,6 +244,8 @@ class MainActivity : Activity() {
 
     private fun press(b: Btn) {
         if (busy) return
+        if (on && b == Buttons.volDn && level == 0) { status("Already at 0%"); return }
+        if (on && b == Buttons.volUp && level == STEPS) { status("Already at 100%"); return }
         volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         if (!transmit(b)) return
         if (b == Buttons.power) {
@@ -243,7 +259,7 @@ class MainActivity : Activity() {
         save(); render(); status("Sent ${b.name}")
     }
 
-    // Drops the speaker to 0 (a few extra presses to be safe), then raises it to START.
+    // Drops the speaker to 0 (a couple of extra presses to be safe) and stays at 0%.
     private fun resync() {
         if (busy) return
         if (!on) { status("Turn the speaker on first"); return }
@@ -252,16 +268,18 @@ class MainActivity : Activity() {
         var i = 0
         val r = object : Runnable {
             override fun run() {
-                if (i < downs + START) {
-                    if (i < downs) { transmit(Buttons.volDn); level = maxOf(0, level - 1) }
-                    else { transmit(Buttons.volUp); level = minOf(STEPS, level + 1) }
+                if (i < downs) {
+                    transmit(Buttons.volDn)
+                    level = maxOf(0, level - 1)
                     i++
                     status("Syncing volume...")
                     render()
                     h.postDelayed(this, 180)
                 } else {
                     busy = false; save()
-                    status("Synced at ${level * 100 / STEPS}%")
+                    level = 0
+                    render()
+                    status("Synced at 0%")
                 }
             }
         }
@@ -275,7 +293,7 @@ class MainActivity : Activity() {
     private fun status(t: String) { statusView.text = t }
 
     private fun render() {
-        val t = SpannableString("${level * 100 / STEPS}%")
+        val t = SpannableString("${pct()}%")
         t.setSpan(RelativeSizeSpan(0.4f), t.length - 1, t.length, 0)
         t.setSpan(ForegroundColorSpan(cMute), t.length - 1, t.length, 0)
         numView.text = t
@@ -287,5 +305,7 @@ class MainActivity : Activity() {
         powerIcon.tint = if (on) Color.WHITE else cOff
         powerIcon.invalidate()
         volCard.alpha = if (on) 1f else 0.55f
+        downBtn.alpha = if (on && level == 0) 0.35f else 1f
+        upBtn.alpha = if (on && level == STEPS) 0.35f else 1f
     }
 }

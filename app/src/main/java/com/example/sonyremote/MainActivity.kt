@@ -1,4 +1,3 @@
-
 package com.example.sonyremote
 
 import android.app.Activity
@@ -12,6 +11,7 @@ import android.hardware.ConsumerIrManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
@@ -30,11 +30,20 @@ class MainActivity : Activity() {
     private val STEPS = 30
     private val START = 3
 
+    private val DELAY_MS = 1000L     // quiet time after the last volume tap before clicks are sent
+    private val GAP_MS = 250L        // time between clicks sent to the speaker
+    private val BOOT_WAIT_MS = 1200L // wait after Power on before the auto sync starts
+    private val SYNC_GAP_MS = 150L   // time between clicks during sync
+
     private val h = Handler(Looper.getMainLooper())
     private var ir: ConsumerIrManager? = null
     private var on = false
-    private var level = START
+    private var level = START        // what the app shows (the target)
+    private var speakerLevel = START // what the speaker has actually received
     private var busy = false
+    private var lastTap = 0L
+    private var nextFree = 0L
+    private var syncJob: Runnable? = null
 
     private lateinit var numView: TextView
     private lateinit var stateView: TextView
@@ -86,7 +95,8 @@ class MainActivity : Activity() {
         ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
         val prefs = getSharedPreferences("s", MODE_PRIVATE)
         on = prefs.getBoolean("on", false)
-        level = prefs.getInt("level", START).coerceIn(0, STEPS)
+        speakerLevel = prefs.getInt("level", START).coerceIn(0, STEPS)
+        level = speakerLevel
 
         setContentView(buildUi())
         render()
@@ -154,8 +164,8 @@ class MainActivity : Activity() {
         }
         downBtn = down
         upBtn = up
-        hold(down) { press(Buttons.volDn) }
-        hold(up) { press(Buttons.volUp) }
+        hold(down) { tapVolume(false) }
+        hold(up) { tapVolume(true) }
         vb.addView(down, LinearLayout.LayoutParams(0, dp(72), 1f).apply { marginEnd = dp(6) })
         vb.addView(up, LinearLayout.LayoutParams(0, dp(72), 1f).apply { marginStart = dp(6) })
         col.addView(vb, lp(-1, -2, 20))
@@ -242,52 +252,119 @@ class MainActivity : Activity() {
         return true
     }
 
-    private fun press(b: Btn) {
-        if (busy) return
-        if (on && b == Buttons.volDn && level == 0) { status("Already at 0%"); return }
-        if (on && b == Buttons.volUp && level == STEPS) { status("Already at 100%"); return }
-        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        if (!transmit(b)) return
-        if (b == Buttons.power) {
-            on = !on
-            if (on) level = START
-        } else if (b == Buttons.volUp) {
-            if (on) level = minOf(STEPS, level + 1)
-        } else if (b == Buttons.volDn) {
-            if (on) level = maxOf(0, level - 1)
-        }
-        save(); render(); status("Sent ${b.name}")
-    }
-
-    // Drops the speaker to 0 (a couple of extra presses to be safe) and stays at 0%.
-    private fun resync() {
+    // Volume taps change the number straight away. The clicks go to the speaker
+    // after DELAY_MS of quiet, one every GAP_MS, so none get missed.
+    private fun tapVolume(up: Boolean) {
         if (busy) return
         if (!on) { status("Turn the speaker on first"); return }
+        if (up && level == STEPS) { status("Already at 100%"); return }
+        if (!up && level == 0) { status("Already at 0%"); return }
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        level += if (up) 1 else -1
+        lastTap = SystemClock.uptimeMillis()
+        render()
+        status("Sending soon...")
+        h.removeCallbacks(pump)
+        h.post(pump)
+    }
+
+    private val pump = object : Runnable {
+        override fun run() {
+            if (busy) return
+            val now = SystemClock.uptimeMillis()
+            val wait = maxOf(lastTap + DELAY_MS - now, nextFree - now)
+            if (wait > 0) { h.postDelayed(this, wait); return }
+            if (level == speakerLevel) return
+            val up = level > speakerLevel
+            if (!transmit(if (up) Buttons.volUp else Buttons.volDn)) {
+                level = speakerLevel; render(); return
+            }
+            speakerLevel += if (up) 1 else -1
+            nextFree = now + GAP_MS
+            save()
+            status(if (level == speakerLevel) "Volume at ${pct()}%" else "Sending volume...")
+            h.postDelayed(this, GAP_MS)
+        }
+    }
+
+    // Other buttons are sent right away, but never closer than GAP_MS to another signal.
+    private fun schedule(b: Btn, then: () -> Unit) {
+        val t = maxOf(SystemClock.uptimeMillis(), nextFree)
+        nextFree = t + GAP_MS
+        h.postAtTime({ if (transmit(b)) then() }, t)
+    }
+
+    private fun press(b: Btn) {
+        if (b == Buttons.power) { togglePower(); return }
+        if (busy) return
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        schedule(b) { status("Sent ${b.name}") }
+    }
+
+    // Power on starts an automatic sync (down to 0%) after a short boot wait.
+    private fun togglePower() {
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        cancelSync()
+        h.removeCallbacks(pump)
+        level = speakerLevel
+        schedule(Buttons.power) { }
+        on = !on
+        if (on) {
+            level = START
+            speakerLevel = START
+            startSync(BOOT_WAIT_MS)
+        } else {
+            status("Sent Power")
+        }
+        save(); render()
+    }
+
+    private fun cancelSync() {
+        syncJob?.let { h.removeCallbacks(it) }
+        syncJob = null
+        busy = false
+    }
+
+    // Sends Vol down enough times to reach 0% (a few extra to be safe) and stays at 0%.
+    private fun startSync(waitMs: Long) {
+        cancelSync()
+        h.removeCallbacks(pump)
         busy = true
-        val downs = STEPS + 2
+        level = speakerLevel
+        status(if (waitMs > 0) "Starting up..." else "Syncing volume...")
+        val total = STEPS + 4
         var i = 0
         val r = object : Runnable {
             override fun run() {
-                if (i < downs) {
-                    transmit(Buttons.volDn)
+                if (i < total) {
+                    if (!transmit(Buttons.volDn)) { busy = false; syncJob = null; render(); return }
                     level = maxOf(0, level - 1)
+                    speakerLevel = level
+                    nextFree = SystemClock.uptimeMillis() + SYNC_GAP_MS
                     i++
                     status("Syncing volume...")
                     render()
-                    h.postDelayed(this, 180)
+                    h.postDelayed(this, SYNC_GAP_MS)
                 } else {
-                    busy = false; save()
-                    level = 0
-                    render()
+                    busy = false; syncJob = null
+                    level = 0; speakerLevel = 0
+                    save(); render()
                     status("Synced at 0%")
                 }
             }
         }
-        h.post(r)
+        syncJob = r
+        h.postDelayed(r, waitMs)
+    }
+
+    private fun resync() {
+        if (busy) return
+        if (!on) { status("Turn the speaker on first"); return }
+        startSync(0)
     }
 
     private fun save() {
-        getSharedPreferences("s", MODE_PRIVATE).edit().putBoolean("on", on).putInt("level", level).apply()
+        getSharedPreferences("s", MODE_PRIVATE).edit().putBoolean("on", on).putInt("level", speakerLevel).apply()
     }
 
     private fun status(t: String) { statusView.text = t }

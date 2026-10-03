@@ -26,27 +26,26 @@ import android.widget.TextView
 
 class MainActivity : Activity() {
     // Measured: the speaker takes 30 clicks to go from 0 to 100%.
-    // START = the step the app assumes after Power on (still to be measured).
+    // START = the level the app assumes the very first time, until you press Sync.
     private val STEPS = 30
     private val START = 3
 
-    private val DELAY_MS = 1000L     // quiet time after the last volume tap before clicks are sent
+    private val DELAY_MS = 500L      // quiet time after the last volume tap before clicks are sent
     private val GAP_MS = 250L        // time between clicks sent to the speaker
-    private val BOOT_WAIT_MS = 1200L // wait after Power on before the auto sync starts
     private val SYNC_GAP_MS = 150L   // time between clicks during sync
+    private val COMBO_WAIT_MS = 2000L // Bluetooth / Pendrive: wait after Power before Input
+    private val INPUT_GAP_MS = 600L   // Pendrive: wait between the two Input presses
 
     private val h = Handler(Looper.getMainLooper())
     private var ir: ConsumerIrManager? = null
-    private var on = false
     private var level = START        // what the app shows (the target)
     private var speakerLevel = START // what the speaker has actually received
     private var busy = false
     private var lastTap = 0L
     private var nextFree = 0L
-    private var syncJob: Runnable? = null
 
     private lateinit var numView: TextView
-    private lateinit var stateView: TextView
+    private lateinit var syncLabel: TextView
     private lateinit var statusView: TextView
     private lateinit var volCard: LinearLayout
     private lateinit var powerIcon: IconView
@@ -94,7 +93,6 @@ class MainActivity : Activity() {
 
         ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
         val prefs = getSharedPreferences("s", MODE_PRIVATE)
-        on = prefs.getBoolean("on", false)
         speakerLevel = prefs.getInt("level", START).coerceIn(0, STEPS)
         level = speakerLevel
 
@@ -117,11 +115,6 @@ class MainActivity : Activity() {
         titles.addView(TextView(this).apply {
             text = "Sony SA-D10"; textSize = 18f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
         })
-        stateView = TextView(this).apply { textSize = 13f; setTextColor(cMute); setPadding(0, dp(2), 0, dp(6)) }
-        stateView.setOnClickListener {
-            on = !on; save(); render(); status("Marked as ${if (on) "on" else "off"} (nothing sent)")
-        }
-        titles.addView(stateView)
         header.addView(titles, lp(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0, 1f))
         powerIcon = IconView(this, IconView.POWER)
         val power = FrameLayout(this).apply { background = powerBg; contentDescription = "Power" }
@@ -170,12 +163,11 @@ class MainActivity : Activity() {
         vb.addView(up, LinearLayout.LayoutParams(0, dp(72), 1f).apply { marginStart = dp(6) })
         col.addView(vb, lp(-1, -2, 20))
 
-        col.addView(TextView(this).apply {
-            text = "Re-sync volume"; textSize = 14f; setTextColor(cMute); gravity = Gravity.CENTER
-            paintFlags = paintFlags or Paint.UNDERLINE_TEXT_FLAG
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            setOnClickListener { resync() }
-        }, lp(-1, -2, 8))
+        // Sync button with progress
+        val sync = pill(IconView.SYNC, "Sync volume")
+        syncLabel = sync.getChildAt(1) as TextView
+        onTap(sync) { resync() }
+        col.addView(sync, lp(-1, dp(52), 12))
 
         // Input
         val input = LinearLayout(this).apply {
@@ -189,6 +181,18 @@ class MainActivity : Activity() {
         })
         tap(input, Buttons.input)
         col.addView(input, lp(-1, dp(52), 12))
+
+        // Bluetooth and Pendrive: Power, then Input (once or twice)
+        val combos = LinearLayout(this)
+        val bt = pill(IconView.BT, "Bluetooth")
+        val usb = pill(IconView.USB, "Pendrive")
+        onTap(bt) { sequence(listOf(Buttons.power to 0L, Buttons.input to COMBO_WAIT_MS), "Bluetooth") }
+        onTap(usb) {
+            sequence(listOf(Buttons.power to 0L, Buttons.input to COMBO_WAIT_MS, Buttons.input to INPUT_GAP_MS), "Pendrive")
+        }
+        combos.addView(bt, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(6) })
+        combos.addView(usb, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(6) })
+        col.addView(combos, lp(-1, -2, 12))
 
         // Media row
         val media = LinearLayout(this)
@@ -212,14 +216,27 @@ class MainActivity : Activity() {
         return root
     }
 
-    // Normal button: tap to send, with a quick press effect.
-    private fun tap(v: View, b: Btn) {
+    private fun onTap(v: View, f: () -> Unit) {
         v.setOnTouchListener { x, e ->
             if (e.action == MotionEvent.ACTION_DOWN) x.alpha = 0.7f
             else if (e.action == MotionEvent.ACTION_UP || e.action == MotionEvent.ACTION_CANCEL) x.alpha = 1f
             false
         }
-        v.setOnClickListener { press(b) }
+        v.setOnClickListener { f() }
+    }
+
+    // Normal button: tap to send.
+    private fun tap(v: View, b: Btn) = onTap(v) { press(b) }
+
+    private fun pill(kind: Int, label: String): LinearLayout {
+        val p = LinearLayout(this).apply {
+            gravity = Gravity.CENTER; background = box(cSurface, 16, cLine); contentDescription = label
+        }
+        p.addView(IconView(this, kind).apply { tint = cInk }, LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(8) })
+        p.addView(TextView(this).apply {
+            text = label; textSize = 15f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
+        })
+        return p
     }
 
     // Volume button: sends once, then repeats while held.
@@ -241,7 +258,7 @@ class MainActivity : Activity() {
 
     // Vol down is locked at 0%, Vol up is locked at 100%, so the count can't drift.
     private fun isLocked(v: View) =
-        on && ((v === downBtn && level == 0) || (v === upBtn && level == STEPS))
+        (v === downBtn && level == 0) || (v === upBtn && level == STEPS)
 
     private fun pct() = Math.round(level * 100f / STEPS)
 
@@ -256,7 +273,6 @@ class MainActivity : Activity() {
     // after DELAY_MS of quiet, one every GAP_MS, so none get missed.
     private fun tapVolume(up: Boolean) {
         if (busy) return
-        if (!on) { status("Turn the speaker on first"); return }
         if (up && level == STEPS) { status("Already at 100%"); return }
         if (!up && level == 0) { status("Already at 0%"); return }
         volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -295,76 +311,68 @@ class MainActivity : Activity() {
     }
 
     private fun press(b: Btn) {
-        if (b == Buttons.power) { togglePower(); return }
-        if (busy) return
+        if (busy && b != Buttons.power) return
         volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         schedule(b) { status("Sent ${b.name}") }
     }
 
-    // Power on starts an automatic sync (down to 0%) after a short boot wait.
-    private fun togglePower() {
+    // Sends a list of buttons, each after its own wait (milliseconds).
+    private fun sequence(steps: List<Pair<Btn, Long>>, name: String) {
+        if (busy) return
         volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        cancelSync()
-        h.removeCallbacks(pump)
-        level = speakerLevel
-        schedule(Buttons.power) { }
-        on = !on
-        if (on) {
-            level = START
-            speakerLevel = START
-            startSync(BOOT_WAIT_MS)
-        } else {
-            status("Sent Power")
+        var t = maxOf(SystemClock.uptimeMillis(), nextFree)
+        for ((b, wait) in steps) {
+            t += wait
+            h.postAtTime({ transmit(b) }, t)
         }
-        save(); render()
-    }
-
-    private fun cancelSync() {
-        syncJob?.let { h.removeCallbacks(it) }
-        syncJob = null
-        busy = false
+        h.postAtTime({ status("$name signals sent") }, t)
+        nextFree = t + GAP_MS
+        status("Sending $name signals...")
     }
 
     // Sends Vol down enough times to reach 0% (a few extra to be safe) and stays at 0%.
-    private fun startSync(waitMs: Long) {
-        cancelSync()
-        h.removeCallbacks(pump)
+    private fun startSync() {
         busy = true
+        h.removeCallbacks(pump)
         level = speakerLevel
-        status(if (waitMs > 0) "Starting up..." else "Syncing volume...")
+        syncLabel.text = "Syncing 0%"
+        status("Syncing volume...")
         val total = STEPS + 4
         var i = 0
         val r = object : Runnable {
             override fun run() {
                 if (i < total) {
-                    if (!transmit(Buttons.volDn)) { busy = false; syncJob = null; render(); return }
+                    if (!transmit(Buttons.volDn)) {
+                        busy = false; syncLabel.text = "Sync volume"; render(); return
+                    }
                     level = maxOf(0, level - 1)
                     speakerLevel = level
                     nextFree = SystemClock.uptimeMillis() + SYNC_GAP_MS
                     i++
-                    status("Syncing volume...")
+                    val done = i * 100 / total
+                    syncLabel.text = "Syncing $done%"
+                    status("Syncing volume... $done%")
                     render()
                     h.postDelayed(this, SYNC_GAP_MS)
                 } else {
-                    busy = false; syncJob = null
+                    busy = false
                     level = 0; speakerLevel = 0
                     save(); render()
+                    syncLabel.text = "Sync volume"
                     status("Synced at 0%")
                 }
             }
         }
-        syncJob = r
-        h.postDelayed(r, waitMs)
+        h.post(r)
     }
 
     private fun resync() {
         if (busy) return
-        if (!on) { status("Turn the speaker on first"); return }
-        startSync(0)
+        startSync()
     }
 
     private fun save() {
-        getSharedPreferences("s", MODE_PRIVATE).edit().putBoolean("on", on).putInt("level", speakerLevel).apply()
+        getSharedPreferences("s", MODE_PRIVATE).edit().putInt("level", speakerLevel).apply()
     }
 
     private fun status(t: String) { statusView.text = t }
@@ -375,14 +383,12 @@ class MainActivity : Activity() {
         t.setSpan(ForegroundColorSpan(cMute), t.length - 1, t.length, 0)
         numView.text = t
         for (i in cells.indices) cells[i].setColor(if (i < level) cAccent else cLine)
-        stateView.text = if (on) "On" else "Off"
         powerBg.shape = GradientDrawable.OVAL
-        powerBg.setColor(if (on) cOff else cSurface)
-        powerBg.setStroke(dp(1), if (on) cOff else cLine)
-        powerIcon.tint = if (on) Color.WHITE else cOff
+        powerBg.setColor(cSurface)
+        powerBg.setStroke(dp(1), cLine)
+        powerIcon.tint = cOff
         powerIcon.invalidate()
-        volCard.alpha = if (on) 1f else 0.55f
-        downBtn.alpha = if (on && level == 0) 0.35f else 1f
-        upBtn.alpha = if (on && level == STEPS) 0.35f else 1f
+        downBtn.alpha = if (level == 0) 0.35f else 1f
+        upBtn.alpha = if (level == STEPS) 0.35f else 1f
     }
 }

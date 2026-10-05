@@ -488,4 +488,230 @@ class MainActivity : Activity() {
             titleView.visibility = View.GONE
             artistView.visibility = View.GONE
             showArtwork(null, null)
+}
+    }
+
+    private fun hasListenerAccess(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: return false
+        val me = ComponentName(this, NowPlayingService::class.java)
+        return flat.split(":").any { ComponentName.unflattenFromString(it) == me }
+    }
+
+    private fun openAccessSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (e: Exception) {
+            status("Open Settings > Notification access and allow Sony Remote")
+        }
+    }
+
+    private fun startNowPlaying() {
+        val ok = hasListenerAccess()
+        accessHint.visibility = if (ok) View.GONE else View.VISIBLE
+        if (!ok) return
+        if (nowPlaying == null) nowPlaying = NowPlaying(this) { t -> onTrack(t) }
+        nowPlaying?.start()
+    }
+
+    private fun stopNowPlaying() {
+        nowPlaying?.stop()
+        trackKey = null
+        artToken++
+        accessHint.visibility = View.GONE
+    }
+
+    private fun onTrack(t: NowPlaying.Track?) {
+        if (!btMode) return
+        val key = if (t == null) null else "${t.title}|${t.artist}|${t.art?.width}x${t.art?.height}|${t.artUri}"
+        if (key == trackKey) return
+        trackKey = key
+        TransitionManager.beginDelayedTransition(col)
+        val title = t?.title.orEmpty()
+        val artist = t?.artist.orEmpty()
+        titleView.text = title
+        artistView.text = artist
+        titleView.visibility = if (title.isEmpty()) View.GONE else View.VISIBLE
+        artistView.visibility = if (artist.isEmpty()) View.GONE else View.VISIBLE
+        loadArt(t)
+    }
+
+    // Decoding and blurring happen off the main thread; a newer track cancels an older result.
+    private fun loadArt(t: NowPlaying.Track?) {
+        val token = ++artToken
+        if (t == null || (t.art == null && t.artUri == null)) {
+            showArtwork(null, null)
+            return
+        }
+        val dm = resources.displayMetrics
+        val bw = Ambient.W
+        val bh = (bw * dm.heightPixels.toFloat() / dm.widthPixels).toInt().coerceAtLeast(bw)
+        worker.execute {
+            var art = t.art
+            if (art == null && t.artUri != null) art = decodeUri(t.artUri)
+            val bg = art?.let { Ambient.fromArtwork(it, bw, bh) }
+            h.post {
+                if (!destroyed && btMode && token == artToken) showArtwork(art, bg)
+            }
+        }
+    }
+
+    // Only local sources: this app has no internet permission.
+    private fun decodeUri(s: String): Bitmap? = try {
+        val u = Uri.parse(s)
+        if (u.scheme == "content" || u.scheme == "file" || u.scheme == "android.resource") {
+            contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it) }
+        } else {
+            null
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun showArtwork(art: Bitmap?, bg: Bitmap?) {
+        TransitionManager.beginDelayedTransition(col)
+        if (art != null && bg != null) {
+            artView.setImageBitmap(art)
+            artView.visibility = View.VISIBLE
+            artShown = true
+            setBackdrop(bg, true)
+        } else {
+            artView.setImageDrawable(null)
+            artView.visibility = View.GONE
+            artShown = false
+            setBackdrop(ambient, true)
+        }
+        applyTheme()
+    }
+
+    // ---------------------------------------------------------------- IR logic (unchanged)
+
+    private fun pct() = Math.round(level * 100f / STEPS)
+
+    private fun transmit(b: Btn): Boolean {
+        val m = ir
+        if (m == null || !m.hasIrEmitter()) { status("This phone has no IR blaster"); return false }
+        m.transmit(Sirc.CARRIER_HZ, Sirc.pattern(b))
+        return true
+    }
+
+    // Volume taps change the number straight away. The clicks go to the speaker
+    // after DELAY_MS of quiet, one every GAP_MS, so none get missed.
+    private fun tapVolume(up: Boolean) {
+        if (busy) return
+        if (up && level == STEPS) { status("Already at 100%"); return }
+        if (!up && level == 0) { status("Already at 0%"); return }
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        level += if (up) 1 else -1
+        lastTap = SystemClock.uptimeMillis()
+        render()
+        status("Sending soon...")
+        h.removeCallbacks(pump)
+        h.post(pump)
+    }
+
+    private val pump = object : Runnable {
+        override fun run() {
+            if (busy) return
+            val now = SystemClock.uptimeMillis()
+            val wait = maxOf(lastTap + DELAY_MS - now, nextFree - now)
+            if (wait > 0) { h.postDelayed(this, wait); return }
+            if (level == speakerLevel) return
+            val up = level > speakerLevel
+            if (!transmit(if (up) Buttons.volUp else Buttons.volDn)) {
+                level = speakerLevel; render(); return
+            }
+            speakerLevel += if (up) 1 else -1
+            nextFree = now + GAP_MS
+            save()
+            status(if (level == speakerLevel) "Volume at ${pct()}%" else "Sending volume...")
+            h.postDelayed(this, GAP_MS)
+        }
+    }
+
+    // Other buttons are sent right away, but never closer than GAP_MS to another signal.
+    private fun schedule(b: Btn, then: () -> Unit) {
+        val t = maxOf(SystemClock.uptimeMillis(), nextFree)
+        nextFree = t + GAP_MS
+        h.postAtTime({ if (transmit(b)) then() }, t)
+    }
+
+    private fun press(b: Btn) {
+        if (busy && b != Buttons.power) return
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        schedule(b) { status("Sent ${b.name}") }
+    }
+
+    // Sends a list of buttons, each after its own wait (milliseconds).
+    private fun sequence(steps: List<Pair<Btn, Long>>, name: String) {
+        if (busy) return
+        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        var t = maxOf(SystemClock.uptimeMillis(), nextFree)
+        for ((b, wait) in steps) {
+            t += wait
+            h.postAtTime({ transmit(b) }, t)
+        }
+        h.postAtTime({ status("$name signals sent") }, t)
+        nextFree = t + GAP_MS
+        status("Sending $name signals...")
+    }
+
+    // Sends Vol down enough times to reach 0% (a few extra to be safe) and stays at 0%.
+    private fun startSync() {
+        busy = true
+        h.removeCallbacks(pump)
+        level = speakerLevel
+        syncLabel.text = "Syncing 0%"
+        status("Syncing volume...")
+        val total = STEPS + 4
+        var i = 0
+        val r = object : Runnable {
+            override fun run() {
+                if (i < total) {
+                    if (!transmit(Buttons.volDn)) {
+                        busy = false; syncLabel.text = "Sync volume"; render(); return
+                    }
+                    level = maxOf(0, level - 1)
+                    speakerLevel = level
+                    nextFree = SystemClock.uptimeMillis() + SYNC_GAP_MS
+                    i++
+                    val done = i * 100 / total
+                    syncLabel.text = "Syncing $done%"
+                    status("Syncing volume... $done%")
+                    render()
+                    h.postDelayed(this, SYNC_GAP_MS)
+                } else {
+                    busy = false
+                    level = 0; speakerLevel = 0
+                    save(); render()
+                    syncLabel.text = "Sync volume"
+                    status("Synced at 0%")
+                }
+            }
+        }
+        h.post(r)
+    }
+
+    private fun resync() {
+        if (busy) return
+        startSync()
+    }
+
+    private fun save() {
+        getSharedPreferences("s", MODE_PRIVATE).edit().putInt("level", speakerLevel).apply()
+    }
+
+    private fun status(t: String) { statusView.text = t }
+
+    private fun render() {
+        val t = SpannableString("${pct()}%")
+        t.setSpan(RelativeSizeSpan(0.4f), t.length - 1, t.length, 0)
+        t.setSpan(ForegroundColorSpan(inkMute), t.length - 1, t.length, 0)
+        numView.text = t
+        val off = withAlpha(ink, 70)
+        for (i in cells.indices) cells[i].setColor(if (i < level) ink else off)
+        downBtn.alpha = if (level == 0) 0.35f else 1f
+        upBtn.alpha = if (level == STEPS) 0.35f else 1f
+    }
+}
+
       

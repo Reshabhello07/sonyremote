@@ -1,28 +1,43 @@
 package com.example.sonyremote
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.graphics.Paint
+import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.ConsumerIrManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.SpannableString
+import android.text.TextUtils
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
+import android.transition.TransitionManager
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewOutlineProvider
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.Interpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     // Measured: the speaker takes 30 clicks to go from 0 to 100%.
@@ -52,10 +67,35 @@ class MainActivity : Activity() {
     private lateinit var downBtn: View
     private lateinit var upBtn: View
     private val cells = ArrayList<GradientDrawable>()
-    private val powerBg = GradientDrawable()
 
-    private var cBg = 0; private var cSurface = 0; private var cInk = 0; private var cMute = 0
-    private var cLine = 0; private var cAccent = 0; private var cOnAccent = 0; private var cOff = 0
+    // Glass look
+    private lateinit var backdrop: BackdropView
+    private lateinit var col: LinearLayout
+    private lateinit var ambient: Bitmap
+    private lateinit var btGlass: GlassDrawable
+    private val glassDrawables = ArrayList<GlassDrawable>()
+    private val glassHosts = ArrayList<View>()
+    private val inkTexts = ArrayList<TextView>()
+    private val muteTexts = ArrayList<TextView>()
+    private val inkIcons = ArrayList<IconView>()
+    private val cAccent = Color.rgb(96, 125, 255)
+    private var night = false
+    private var lightStyle = false
+    private var ink = Color.WHITE
+    private var inkMute = Color.WHITE
+
+    // Bluetooth mode: the remote takes the colours of the song playing on the phone
+    private lateinit var artView: ImageView
+    private lateinit var titleView: TextView
+    private lateinit var artistView: TextView
+    private lateinit var accessHint: TextView
+    private var btMode = false
+    private var artShown = false
+    private var nowPlaying: NowPlaying? = null
+    private var trackKey: String? = null
+    private var artToken = 0
+    private var destroyed = false
+    private val worker = Executors.newSingleThreadExecutor()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -68,28 +108,15 @@ class MainActivity : Activity() {
     private fun lp(w: Int, hgt: Int, top: Int = 0, weight: Float = 0f) =
         LinearLayout.LayoutParams(w, hgt, weight).apply { topMargin = dp(top) }
 
+    private fun withAlpha(c: Int, a: Int) = (c and 0x00FFFFFF) or (a shl 24)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+        night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
-        if (night) {
-            cBg = Color.parseColor("#14161A"); cSurface = Color.parseColor("#1E2127")
-            cInk = Color.parseColor("#EEF0F3"); cMute = Color.parseColor("#9AA1AD")
-            cLine = Color.parseColor("#2B2F37"); cAccent = Color.parseColor("#7B93FF")
-            cOnAccent = Color.parseColor("#10131A"); cOff = Color.parseColor("#FF6B57")
-        } else {
-            cBg = Color.parseColor("#F4F5F7"); cSurface = Color.WHITE
-            cInk = Color.parseColor("#16181D"); cMute = Color.parseColor("#6B7280")
-            cLine = Color.parseColor("#E4E6EB"); cAccent = Color.parseColor("#3B5BDB")
-            cOnAccent = Color.WHITE; cOff = Color.parseColor("#D6402F")
-        }
-        window.statusBarColor = cBg
-        window.navigationBarColor = cBg
-        if (!night) {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility =
-                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-        }
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
 
         ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
         val prefs = getSharedPreferences("s", MODE_PRIVATE)
@@ -97,47 +124,126 @@ class MainActivity : Activity() {
         level = speakerLevel
 
         setContentView(buildUi())
-        render()
+        val dm = resources.displayMetrics
+        val bh = (Ambient.W * dm.heightPixels.toFloat() / dm.widthPixels).toInt().coerceAtLeast(Ambient.W)
+        ambient = Ambient.gradient(Ambient.W, bh, night)
+        setBackdrop(ambient, false)
+        applyTheme()
         status(if (ir?.hasIrEmitter() == true) "Ready" else "This phone has no IR blaster")
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (btMode) startNowPlaying()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        nowPlaying?.stop()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        destroyed = true
+        nowPlaying?.stop()
+        worker.shutdownNow()
+    }
+
+    // ---------------------------------------------------------------- UI
+
+    @Suppress("DEPRECATION")
     private fun buildUi(): View {
-        val root = ScrollView(this).apply { setBackgroundColor(cBg); isFillViewport = true }
-        val col = LinearLayout(this).apply {
+        val root = FrameLayout(this)
+        backdrop = BackdropView(this)
+        root.addView(backdrop, FrameLayout.LayoutParams(-1, -1))
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isVerticalScrollBarEnabled = false
+        }
+        root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+        col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(20), dp(20), dp(28))
         }
-        root.addView(col)
+        scroll.addView(col)
+
+        // Draw behind the status and navigation bars, and keep the content clear of them.
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            col.setPadding(
+                dp(20), dp(20) + insets.systemWindowInsetTop,
+                dp(20), dp(28) + insets.systemWindowInsetBottom,
+            )
+            insets
+        }
+        // Glass reads the backdrop at its own position, so it repaints when things move.
+        scroll.setOnScrollChangeListener { _, _, _, _, _ -> invalidateGlass() }
+        col.viewTreeObserver.addOnGlobalLayoutListener { invalidateGlass() }
 
         // Header
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titles.addView(TextView(this).apply {
-            text = "Sony SA-D10"; textSize = 18f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
-        })
+        titles.addView(inkText(TextView(this).apply {
+            text = "Sony SA-D10"; textSize = 18f; setTypeface(null, Typeface.BOLD)
+        }))
         header.addView(titles, lp(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0, 1f))
         powerIcon = IconView(this, IconView.POWER)
-        val power = FrameLayout(this).apply { background = powerBg; contentDescription = "Power" }
+        val power = FrameLayout(this).apply { contentDescription = "Power" }
+        glass(power)
         power.addView(powerIcon, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
-        tap(power, Buttons.power)
+        onTap(power) {
+            setBtMode(false)
+            press(Buttons.power)
+        }
         header.addView(power, LinearLayout.LayoutParams(dp(48), dp(48)))
         col.addView(header, lp(-1, -2))
 
-        // Volume card
+        // Volume card. In Bluetooth mode it also shows the cover, title and artist.
         volCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            background = box(cSurface, 28, cLine)
             setPadding(dp(20), dp(28), dp(20), dp(22))
+            clipChildren = false
+            clipToPadding = false
         }
-        numView = TextView(this).apply {
-            textSize = 80f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
+        glass(volCard, radiusDp = 32, elevDp = 8)
+
+        val artSize = minOf(resources.displayMetrics.widthPixels - dp(40 + 40 + 24), dp(300))
+        artView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            visibility = View.GONE
+            contentDescription = "Album art"
+            elevation = dp(14).toFloat()
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, dp(22).toFloat())
+                    outline.setAlpha(1f)
+                }
+            }
+        }
+        volCard.addView(artView, LinearLayout.LayoutParams(artSize, artSize).apply { bottomMargin = dp(16) })
+
+        titleView = inkText(TextView(this).apply {
+            textSize = 18f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER
+            maxLines = 1; ellipsize = TextUtils.TruncateAt.END; visibility = View.GONE
+        })
+        artistView = inkText(TextView(this).apply {
+            textSize = 14f; gravity = Gravity.CENTER
+            maxLines = 1; ellipsize = TextUtils.TruncateAt.END; visibility = View.GONE
+        }, true)
+        volCard.addView(titleView, lp(-1, -2))
+        volCard.addView(artistView, lp(-1, -2, 2))
+
+        numView = inkText(TextView(this).apply {
+            textSize = 80f; setTypeface(null, Typeface.BOLD)
             includeFontPadding = false
-        }
+        })
         volCard.addView(numView, lp(-2, -2))
         val bar = LinearLayout(this)
         for (i in 0 until STEPS) {
-            val d = box(cLine, 3)
+            val d = box(Color.WHITE, 3)
             cells.add(d)
             val v = View(this).apply { background = d }
             bar.addView(v, LinearLayout.LayoutParams(0, dp(10), 1f).apply { marginStart = dp(1); marginEnd = dp(1) })
@@ -145,16 +251,27 @@ class MainActivity : Activity() {
         volCard.addView(bar, lp(-1, dp(10), 22))
         col.addView(volCard, lp(-1, -2, 20))
 
+        // Shown in Bluetooth mode until the app is allowed to read the music player.
+        accessHint = inkText(TextView(this).apply {
+            text = "Show album art: allow notification access"
+            textSize = 13f; gravity = Gravity.CENTER
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            visibility = View.GONE
+        })
+        glass(accessHint, elevDp = 4)
+        onTap(accessHint) { openAccessSettings() }
+        col.addView(accessHint, lp(-1, -2, 12))
+
         // Volume buttons
         val vb = LinearLayout(this)
-        val down = TextView(this).apply {
-            text = "\u2212"; textSize = 30f; gravity = Gravity.CENTER; setTextColor(cInk)
-            background = box(cSurface, 20, cLine); contentDescription = "Volume down"
-        }
-        val up = TextView(this).apply {
-            text = "+"; textSize = 30f; gravity = Gravity.CENTER; setTextColor(cOnAccent)
-            background = box(cAccent, 20); contentDescription = "Volume up"
-        }
+        val down = inkText(TextView(this).apply {
+            text = "\u2212"; textSize = 30f; gravity = Gravity.CENTER; contentDescription = "Volume down"
+        })
+        val up = inkText(TextView(this).apply {
+            text = "+"; textSize = 30f; gravity = Gravity.CENTER; contentDescription = "Volume up"
+        })
+        glass(down, elevDp = 6)
+        glass(up, tint = cAccent, boost = 1.7f, elevDp = 6)
         downBtn = down
         upBtn = up
         hold(down) { tapVolume(false) }
@@ -170,24 +287,32 @@ class MainActivity : Activity() {
         col.addView(sync, lp(-1, dp(52), 12))
 
         // Input
-        val input = LinearLayout(this).apply {
-            gravity = Gravity.CENTER; background = box(cSurface, 16, cLine)
-            contentDescription = "Input"
+        val input = pill(IconView.INPUT, "Input")
+        onTap(input) {
+            setBtMode(false)
+            press(Buttons.input)
         }
-        val inIcon = IconView(this, IconView.INPUT).apply { tint = cInk }
-        input.addView(inIcon, LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(8) })
-        input.addView(TextView(this).apply {
-            text = "Input"; textSize = 15f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
-        })
-        tap(input, Buttons.input)
         col.addView(input, lp(-1, dp(52), 12))
 
         // Bluetooth and Pendrive: Power, then Input (once or twice)
         val combos = LinearLayout(this)
         val bt = pill(IconView.BT, "Bluetooth")
+        btGlass = bt.background as GlassDrawable
         val usb = pill(IconView.USB, "Pendrive")
-        onTap(bt) { sequence(listOf(Buttons.power to 0L, Buttons.input to COMBO_WAIT_MS), "Bluetooth") }
+        onTap(bt) {
+            if (busy) return@onTap
+            if (btMode) {
+                // Second tap leaves Bluetooth mode. No IR is sent: Power is a toggle.
+                setBtMode(false)
+                status("Bluetooth mode off")
+            } else {
+                sequence(listOf(Buttons.power to 0L, Buttons.input to COMBO_WAIT_MS), "Bluetooth")
+                setBtMode(true)
+            }
+        }
         onTap(usb) {
+            if (busy) return@onTap
+            setBtMode(false)
             sequence(listOf(Buttons.power to 0L, Buttons.input to COMBO_WAIT_MS, Buttons.input to INPUT_GAP_MS), "Pendrive")
         }
         combos.addView(bt, LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(6) })
@@ -204,22 +329,114 @@ class MainActivity : Activity() {
             Triple(IconView.SKIP_FWD, Buttons.skipForward, "Skip forward")
         )
         for ((kind, btn, label) in items) {
-            val cell = FrameLayout(this).apply { background = box(cSurface, 16, cLine); contentDescription = label }
-            cell.addView(IconView(this, kind).apply { tint = cInk }, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+            val cell = FrameLayout(this).apply { contentDescription = label }
+            glass(cell)
+            val icon = IconView(this, kind)
+            inkIcons.add(icon)
+            cell.addView(icon, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
             tap(cell, btn)
             media.addView(cell, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
         }
         col.addView(media, lp(-1, -2, 16))
 
-        statusView = TextView(this).apply { textSize = 13f; setTextColor(cMute); gravity = Gravity.CENTER }
+        statusView = inkText(TextView(this).apply { textSize = 13f; gravity = Gravity.CENTER }, true)
         col.addView(statusView, lp(-1, -2, 20))
         return root
     }
 
+    /** Registers a text view so its colour follows the current glass style. */
+    private fun inkText(t: TextView, mute: Boolean = false): TextView {
+        if (mute) muteTexts.add(t) else inkTexts.add(t)
+        return t
+    }
+
+    /** Turns [v] into a pane of glass: backdrop, film, rim, and a soft shadow. */
+    private fun glass(
+        v: View,
+        radiusDp: Int = -1,
+        tint: Int = Color.WHITE,
+        boost: Float = 1f,
+        elevDp: Int = 5,
+    ): GlassDrawable {
+        val d = GlassDrawable(v, backdrop, radiusDp, resources.displayMetrics.density, tint, boost)
+        d.light = lightStyle
+        v.background = d
+        v.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                val side = minOf(view.width, view.height).toFloat()
+                val r = if (radiusDp < 0) side / 2f else minOf(dp(radiusDp).toFloat(), side / 2f)
+                outline.setRoundRect(0, 0, view.width, view.height, r)
+                outline.setAlpha(1f)
+            }
+        }
+        v.elevation = dp(elevDp).toFloat()
+        glassDrawables.add(d)
+        glassHosts.add(v)
+        return d
+    }
+
+    private fun pill(kind: Int, label: String): LinearLayout {
+        val p = LinearLayout(this).apply { gravity = Gravity.CENTER; contentDescription = label }
+        glass(p)
+        val icon = IconView(this, kind)
+        inkIcons.add(icon)
+        p.addView(icon, LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(8) })
+        p.addView(inkText(TextView(this).apply {
+            text = label; textSize = 15f; setTypeface(null, Typeface.BOLD)
+        }))
+        return p
+    }
+
+    private fun invalidateGlass() {
+        for (v in glassHosts) v.invalidate()
+    }
+
+    private fun setBackdrop(b: Bitmap, animate: Boolean) {
+        backdrop.setBitmap(b, animate)
+        invalidateGlass()
+    }
+
+    // Ink and glass follow what is behind them: light only on the plain light wash.
+    @Suppress("DEPRECATION")
+    private fun applyTheme() {
+        lightStyle = !night && !artShown
+        ink = if (lightStyle) Color.rgb(22, 24, 29) else Color.WHITE
+        inkMute = if (lightStyle) Color.rgb(90, 98, 112) else withAlpha(Color.WHITE, 175)
+        for (t in inkTexts) t.setTextColor(ink)
+        for (t in muteTexts) t.setTextColor(inkMute)
+        for (i in inkIcons) {
+            i.tint = ink
+            i.invalidate()
+        }
+        powerIcon.tint = if (lightStyle) Color.rgb(214, 64, 47) else Color.rgb(255, 107, 87)
+        powerIcon.invalidate()
+        for (g in glassDrawables) g.light = lightStyle
+
+        var f = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        if (lightStyle) {
+            f = f or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
+        window.decorView.systemUiVisibility = f
+        render()
+    }
+
+    private fun pressFx(v: View, down: Boolean, markPressed: Boolean = false) {
+        if (markPressed) v.isPressed = down
+        v.animate().cancel()
+        val s = if (down) 0.96f else 1f
+        val ip: Interpolator = if (down) AccelerateDecelerateInterpolator() else OvershootInterpolator(2.2f)
+        v.animate().scaleX(s).scaleY(s).setDuration(if (down) 90L else 280L).setInterpolator(ip).start()
+    }
+
     private fun onTap(v: View, f: () -> Unit) {
         v.setOnTouchListener { x, e ->
-            if (e.action == MotionEvent.ACTION_DOWN) x.alpha = 0.7f
-            else if (e.action == MotionEvent.ACTION_UP || e.action == MotionEvent.ACTION_CANCEL) x.alpha = 1f
+            // Not touching isPressed here: clearing it before the click would swallow the click.
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> pressFx(x, true)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> pressFx(x, false)
+            }
             false
         }
         v.setOnClickListener { f() }
@@ -228,17 +445,6 @@ class MainActivity : Activity() {
     // Normal button: tap to send.
     private fun tap(v: View, b: Btn) = onTap(v) { press(b) }
 
-    private fun pill(kind: Int, label: String): LinearLayout {
-        val p = LinearLayout(this).apply {
-            gravity = Gravity.CENTER; background = box(cSurface, 16, cLine); contentDescription = label
-        }
-        p.addView(IconView(this, kind).apply { tint = cInk }, LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginEnd = dp(8) })
-        p.addView(TextView(this).apply {
-            text = label; textSize = 15f; setTypeface(null, Typeface.BOLD); setTextColor(cInk)
-        })
-        return p
-    }
-
     // Volume button: sends once, then repeats while held.
     private fun hold(v: View, f: () -> Unit) {
         val rep = object : Runnable {
@@ -246,8 +452,13 @@ class MainActivity : Activity() {
         }
         v.setOnTouchListener { x, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { if (!isLocked(x)) x.alpha = 0.7f; f(); h.postDelayed(rep, 450) }
+                MotionEvent.ACTION_DOWN -> {
+                    if (!isLocked(x)) pressFx(x, true, true)
+                    f()
+                    h.postDelayed(rep, 450)
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    pressFx(x, false, true)
                     x.alpha = if (isLocked(x)) 0.35f else 1f
                     h.removeCallbacks(rep)
                 }
@@ -260,135 +471,21 @@ class MainActivity : Activity() {
     private fun isLocked(v: View) =
         (v === downBtn && level == 0) || (v === upBtn && level == STEPS)
 
-    private fun pct() = Math.round(level * 100f / STEPS)
+    // ---------------------------------------------------------------- Bluetooth mode
 
-    private fun transmit(b: Btn): Boolean {
-        val m = ir
-        if (m == null || !m.hasIrEmitter()) { status("This phone has no IR blaster"); return false }
-        m.transmit(Sirc.CARRIER_HZ, Sirc.pattern(b))
-        return true
-    }
-
-    // Volume taps change the number straight away. The clicks go to the speaker
-    // after DELAY_MS of quiet, one every GAP_MS, so none get missed.
-    private fun tapVolume(up: Boolean) {
-        if (busy) return
-        if (up && level == STEPS) { status("Already at 100%"); return }
-        if (!up && level == 0) { status("Already at 0%"); return }
-        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        level += if (up) 1 else -1
-        lastTap = SystemClock.uptimeMillis()
-        render()
-        status("Sending soon...")
-        h.removeCallbacks(pump)
-        h.post(pump)
-    }
-
-    private val pump = object : Runnable {
-        override fun run() {
-            if (busy) return
-            val now = SystemClock.uptimeMillis()
-            val wait = maxOf(lastTap + DELAY_MS - now, nextFree - now)
-            if (wait > 0) { h.postDelayed(this, wait); return }
-            if (level == speakerLevel) return
-            val up = level > speakerLevel
-            if (!transmit(if (up) Buttons.volUp else Buttons.volDn)) {
-                level = speakerLevel; render(); return
-            }
-            speakerLevel += if (up) 1 else -1
-            nextFree = now + GAP_MS
-            save()
-            status(if (level == speakerLevel) "Volume at ${pct()}%" else "Sending volume...")
-            h.postDelayed(this, GAP_MS)
-        }
-    }
-
-    // Other buttons are sent right away, but never closer than GAP_MS to another signal.
-    private fun schedule(b: Btn, then: () -> Unit) {
-        val t = maxOf(SystemClock.uptimeMillis(), nextFree)
-        nextFree = t + GAP_MS
-        h.postAtTime({ if (transmit(b)) then() }, t)
-    }
-
-    private fun press(b: Btn) {
-        if (busy && b != Buttons.power) return
-        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        schedule(b) { status("Sent ${b.name}") }
-    }
-
-    // Sends a list of buttons, each after its own wait (milliseconds).
-    private fun sequence(steps: List<Pair<Btn, Long>>, name: String) {
-        if (busy) return
-        volCard.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        var t = maxOf(SystemClock.uptimeMillis(), nextFree)
-        for ((b, wait) in steps) {
-            t += wait
-            h.postAtTime({ transmit(b) }, t)
-        }
-        h.postAtTime({ status("$name signals sent") }, t)
-        nextFree = t + GAP_MS
-        status("Sending $name signals...")
-    }
-
-    // Sends Vol down enough times to reach 0% (a few extra to be safe) and stays at 0%.
-    private fun startSync() {
-        busy = true
-        h.removeCallbacks(pump)
-        level = speakerLevel
-        syncLabel.text = "Syncing 0%"
-        status("Syncing volume...")
-        val total = STEPS + 4
-        var i = 0
-        val r = object : Runnable {
-            override fun run() {
-                if (i < total) {
-                    if (!transmit(Buttons.volDn)) {
-                        busy = false; syncLabel.text = "Sync volume"; render(); return
-                    }
-                    level = maxOf(0, level - 1)
-                    speakerLevel = level
-                    nextFree = SystemClock.uptimeMillis() + SYNC_GAP_MS
-                    i++
-                    val done = i * 100 / total
-                    syncLabel.text = "Syncing $done%"
-                    status("Syncing volume... $done%")
-                    render()
-                    h.postDelayed(this, SYNC_GAP_MS)
-                } else {
-                    busy = false
-                    level = 0; speakerLevel = 0
-                    save(); render()
-                    syncLabel.text = "Sync volume"
-                    status("Synced at 0%")
-                }
-            }
-        }
-        h.post(r)
-    }
-
-    private fun resync() {
-        if (busy) return
-        startSync()
-    }
-
-    private fun save() {
-        getSharedPreferences("s", MODE_PRIVATE).edit().putInt("level", speakerLevel).apply()
-    }
-
-    private fun status(t: String) { statusView.text = t }
-
-    private fun render() {
-        val t = SpannableString("${pct()}%")
-        t.setSpan(RelativeSizeSpan(0.4f), t.length - 1, t.length, 0)
-        t.setSpan(ForegroundColorSpan(cMute), t.length - 1, t.length, 0)
-        numView.text = t
-        for (i in cells.indices) cells[i].setColor(if (i < level) cAccent else cLine)
-        powerBg.shape = GradientDrawable.OVAL
-        powerBg.setColor(cSurface)
-        powerBg.setStroke(dp(1), cLine)
-        powerIcon.tint = cOff
-        powerIcon.invalidate()
-        downBtn.alpha = if (level == 0) 0.35f else 1f
-        upBtn.alpha = if (level == STEPS) 0.35f else 1f
-    }
-}
+    private fun setBtMode(on: Boolean) {
+        if (btMode == on) return
+        btMode = on
+        TransitionManager.beginDelayedTransition(col)
+        btGlass.emphasis = if (on) 1f else 0f
+        numView.textSize = if (on) 40f else 80f
+        (numView.layoutParams as LinearLayout.LayoutParams).topMargin = dp(if (on) 10 else 0)
+        numView.requestLayout()
+        if (on) {
+            startNowPlaying()
+        } else {
+            stopNowPlaying()
+            titleView.visibility = View.GONE
+            artistView.visibility = View.GONE
+            showArtwork(null, null)
+      

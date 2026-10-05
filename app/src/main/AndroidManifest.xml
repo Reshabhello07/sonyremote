@@ -15,5 +15,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Lets the app read the song and album art of the music app playing on the phone.
+             Switched on by the user in Settings > Notification access. -->
+        <service
+            android:name=".NowPlayingService"
+            android:exported="true"
+            android:label="Sony Remote"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

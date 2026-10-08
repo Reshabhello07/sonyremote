@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Infrared waves coming out of the top of the remote -->
+    <path
+        android:pathData="M49.5,32.64 A7,7 0 0 1 58.5,32.64"
+        android:strokeColor="#F2FFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M46.29,28.81 A12,12 0 0 1 61.71,28.81"
+        android:strokeColor="#B3FFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M43.07,24.98 A17,17 0 0 1 64.93,24.98"
+        android:strokeColor="#66FFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round" />
+
+    <!-- The remote: a pane of glass -->
+    <path
+        android:pathData="M50,38 H58 A9,9 0 0 1 67,47 V75 A9,9 0 0 1 58,84 H50 A9,9 0 0 1 41,75 V47 A9,9 0 0 1 50,38 Z"
+        android:fillColor="#4DFFFFFF"
+        android:strokeColor="#E6FFFFFF"
+        android:strokeWidth="1.5" />
+
+    <!-- Big round dial -->
+    <path
+        android:pathData="M47.5,52 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0"
+        android:fillColor="#59FFFFFF"
+        android:strokeColor="#F2FFFFFF"
+        android:strokeWidth="1.2" />
+
+    <!-- Two small buttons -->
+    <path
+        android:pathData="M43.9,67 a3.6,3.6 0 1,0 7.2,0 a3.6,3.6 0 1,0 -7.2,0"
+        android:fillColor="#59FFFFFF"
+        android:strokeColor="#CCFFFFFF"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M56.9,67 a3.6,3.6 0 1,0 7.2,0 a3.6,3.6 0 1,0 -7.2,0"
+        android:fillColor="#59FFFFFF"
+        android:strokeColor="#CCFFFFFF"
+        android:strokeWidth="1" />
+
+    <!-- Bottom button -->
+    <path
+        android:pathData="M51,76.5 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0"
+        android:fillColor="#59FFFFFF"
+        android:strokeColor="#CCFFFFFF"
+        android:strokeWidth="1" />
+</vector>
